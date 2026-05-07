@@ -1,4 +1,4 @@
-#this also doesn't work. but i think if actually optimized this idea could work
+
 import os
 import subprocess
 import torch
@@ -186,74 +186,63 @@ __global__ void forward_kernel_optimized(
     
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int tid = ty * 32 + tx;
-    
-    // Each block handles 128 rows of X (M dimension) and 32 columns of W (N dimension)
-    // Thread block is 32x32? No, let's use 32x8 threads, each thread handles 4 rows.
-    // Wait, let's stick to 32x32 threads for simplicity, but each thread computes 4 rows.
-    // row_base is blockIdx.y * 128. Thread ty computes row_base + ty, + ty+32, + ty+64, + ty+96.
-    int row_base = blockIdx.y * 128;
-    int col = blockIdx.x * TILE_SIZE + tx;
-    
-    __shared__ float Xs[128][32]; // 16KB
-    __shared__ float Ws[32][32];  // 4KB
-    
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int tid = ty * 16 + tx;
+
+    int row_start = blockIdx.y * 64 + ty * 4;
+    int col_start = blockIdx.x * 64 + tx * 4;
+
+    __shared__ float Xs[64][64];
+    __shared__ float Ws[64][64];
+
+    float sums[4][4] = {
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f}
+    };
     float limit = 1.0f / sqrtf((float)K);
     float two_limit = 2.0f * limit;
 
-    // Check if this entire N-tile [col_start, col_start + 32) has any overrides at all
-    // Since it's a contiguous block, we can check the range of target indices
-    int block_col_start = blockIdx.x * TILE_SIZE;
-    bool has_any_overrides = false;
-    // (Simplified check: if any row of the 32xK tile intersects the block)
-    // For now, we'll just check if the range [block_col_start*K, (block_col_start+32)*K) overlaps
-    // with [block_start, block_start + num_sparse] (handling wrap-around is complex, let's be conservative)
-    has_any_overrides = true; // Conservative default
+    for (int k_tile = 0; k_tile < (K + 63) / 64; ++k_tile) {
+        for (int idx = tid; idx < 4096; idx += 256) {
+            int local_r = idx / 64;
+            int local_c = idx % 64;
+            int r = blockIdx.y * 64 + local_r;
+            int c = k_tile * 64 + local_c;
+            Xs[local_r][local_c] = (r < M && c < K) ? X[r * K + c] : 0.0f;
+        }
 
-    for (int k_tile = 0; k_tile < (K + TILE_SIZE - 1) / TILE_SIZE; ++k_tile) {
-        // Load X tile: 128 rows x 32 cols
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int r = row_base + ty + i * 32;
-            int c = k_tile * TILE_SIZE + tx;
-            if (r < M && c < K) {
-                Xs[ty + i * 32][tx] = X[r * K + c];
-            } else {
-                Xs[ty + i * 32][tx] = 0.0f;
+        for (int idx = tid; idx < 4096; idx += 256) {
+            int local_k = idx / 64;
+            int local_n = idx % 64;
+            int w_row = blockIdx.x * 64 + local_n;
+            int w_col = k_tile * 64 + local_k;
+
+            float w_val = 0.0f;
+            if (w_row < N && w_col < K) {
+                int target = w_row * K + w_col;
+                int ov_idx = get_block_override_idx(target, block_start, num_sparse, num_elements);
+                if (ov_idx >= 0) {
+                    w_val = override_values[ov_idx];
+                } else {
+                    unsigned int x = (unsigned int)(target + seed);
+                    x ^= (x >> 16); x *= 0x85ebca6b; x ^= (x >> 13); x *= 0xc2b2ae35; x ^= (x >> 16);
+                    w_val = ((float)x / 4294967296.0f) * two_limit - limit;
+                }
             }
+            Ws[local_k][local_n] = w_val;
         }
-        
-        // Load W tile: 32 cols (N) x 32 rows (K)
-        // thread tid loads one W[n, k]
-        int local_k = tid % TILE_SIZE;
-        int local_n = tid / TILE_SIZE;
-        int w_row = blockIdx.x * TILE_SIZE + local_n;
-        int w_col = k_tile * TILE_SIZE + local_k;
-        
-        float w_val = 0.0f;
-        if (w_row < N && w_col < K) {
-            int target = w_row * K + w_col;
-            int ov_idx = get_block_override_idx(target, block_start, num_sparse, num_elements);
-            if (ov_idx >= 0) {
-                w_val = override_values[ov_idx];
-            } else {
-                // Inline procedural weight generation with pre-calc constants
-                unsigned int x = (unsigned int)(target + seed);
-                x ^= (x >> 16); x *= 0x85ebca6b; x ^= (x >> 13); x *= 0xc2b2ae35; x ^= (x >> 16);
-                w_val = ((float)x / 4294967296.0f) * two_limit - limit;
-            }
-        }
-        Ws[local_k][local_n] = w_val;
         
         __syncthreads();
         
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            float w = Ws[k][tx];
+        for (int k = 0; k < 64; ++k) {
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                sums[i] += Xs[ty + i * 32][k] * w;
+                float x_val = Xs[ty * 4 + i][k];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sums[i][j] += x_val * Ws[k][tx * 4 + j];
+                }
             }
         }
         __syncthreads();
@@ -261,11 +250,15 @@ __global__ void forward_kernel_optimized(
     
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        int r = row_base + ty + i * 32;
-        if (r < M && col < N) {
-            float out = sums[i];
-            if (has_bias) out += bias[col];
-            Y[r * N + col] = out;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int r = row_start + i;
+            int c = col_start + j;
+            if (r < M && c < N) {
+                float out = sums[i][j];
+                if (has_bias) out += bias[c];
+                Y[r * N + c] = out;
+            }
         }
     }
 }
@@ -278,57 +271,63 @@ __global__ void backward_dx_kernel_optimized(
     
     int tx = threadIdx.x;
     int ty = threadIdx.y;
-    int tid = ty * 32 + tx;
-    
-    int row_base = blockIdx.y * 128;
-    int col = blockIdx.x * TILE_SIZE + tx;
-    
-    __shared__ float sdYs[128][32];
-    __shared__ float Ws[32][32];
-    
-    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int tid = ty * 16 + tx;
+
+    int row_start = blockIdx.y * 64 + ty * 4;
+    int col_start = blockIdx.x * 64 + tx * 4;
+
+    __shared__ float sdYs[64][64];
+    __shared__ float Ws[64][64];
+
+    float sums[4][4] = {
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f},
+        {0.0f, 0.0f, 0.0f, 0.0f}
+    };
     float limit = 1.0f / sqrtf((float)K);
     float two_limit = 2.0f * limit;
 
-    for (int n_tile = 0; n_tile < (N + TILE_SIZE - 1) / TILE_SIZE; ++n_tile) {
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            int r = row_base + ty + i * 32;
-            int c = n_tile * TILE_SIZE + tx;
-            if (r < M && c < N) {
-                sdYs[ty + i * 32][tx] = dY[r * N + c];
-            } else {
-                sdYs[ty + i * 32][tx] = 0.0f;
-            }
+    for (int n_tile = 0; n_tile < (N + 63) / 64; ++n_tile) {
+        for (int idx = tid; idx < 4096; idx += 256) {
+            int local_r = idx / 64;
+            int local_n = idx % 64;
+            int r = blockIdx.y * 64 + local_r;
+            int n_col = n_tile * 64 + local_n;
+            sdYs[local_r][local_n] = (r < M && n_col < N) ? dY[r * N + n_col] : 0.0f;
         }
-        
-        int local_k = tid % TILE_SIZE;
-        int local_n = tid / TILE_SIZE;
-        int w_row = n_tile * TILE_SIZE + local_n;
-        int w_col = blockIdx.x * TILE_SIZE + local_k;
-        
-        float w_val = 0.0f;
-        if (w_row < N && w_col < K) {
-            int target = w_row * K + w_col;
-            int ov_idx = get_block_override_idx(target, block_start, num_sparse, num_elements);
-            if (ov_idx >= 0) {
-                w_val = override_values[ov_idx];
-            } else {
-                unsigned int x = (unsigned int)(target + seed);
-                x ^= (x >> 16); x *= 0x85ebca6b; x ^= (x >> 13); x *= 0xc2b2ae35; x ^= (x >> 16);
-                w_val = ((float)x / 4294967296.0f) * two_limit - limit;
+
+        for (int idx = tid; idx < 4096; idx += 256) {
+            int local_n = idx / 64;
+            int local_k = idx % 64;
+            int w_row = n_tile * 64 + local_n;
+            int w_col = blockIdx.x * 64 + local_k;
+
+            float w_val = 0.0f;
+            if (w_row < N && w_col < K) {
+                int target = w_row * K + w_col;
+                int ov_idx = get_block_override_idx(target, block_start, num_sparse, num_elements);
+                if (ov_idx >= 0) {
+                    w_val = override_values[ov_idx];
+                } else {
+                    unsigned int x = (unsigned int)(target + seed);
+                    x ^= (x >> 16); x *= 0x85ebca6b; x ^= (x >> 13); x *= 0xc2b2ae35; x ^= (x >> 16);
+                    w_val = ((float)x / 4294967296.0f) * two_limit - limit;
+                }
             }
+            Ws[local_n][local_k] = w_val;
         }
-        Ws[local_k][local_n] = w_val;
         
         __syncthreads();
         
-        #pragma unroll
-        for (int n = 0; n < TILE_SIZE; ++n) {
-            float w = Ws[n][tx];
+        for (int n = 0; n < 64; ++n) {
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                sums[i] += sdYs[ty + i * 32][n] * w;
+                float dy_val = sdYs[ty * 4 + i][n];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sums[i][j] += dy_val * Ws[n][tx * 4 + j];
+                }
             }
         }
         __syncthreads();
@@ -336,9 +335,13 @@ __global__ void backward_dx_kernel_optimized(
     
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        int r = row_base + ty + i * 32;
-        if (r < M && col < K) {
-            dX[r * K + col] = sums[i];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int r = row_start + i;
+            int c = col_start + j;
+            if (r < M && c < K) {
+                dX[r * K + c] = sums[i][j];
+            }
         }
     }
 }
@@ -348,18 +351,26 @@ __global__ void backward_override_kernel(
     float* dOverride,
     int M, int K, int N, int num_sparse,
     int block_start, int num_elements) {
-    
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_sparse) {
         // Compute flat index on-the-fly from block offset
         int flat_idx = (block_start + idx) % num_elements;
         int n = flat_idx / K;
         int k = flat_idx % K;
-        
+
         float sum = 0.0f;
-        for (int m = 0; m < M; ++m) {
+        int m = 0;
+        for (; m + 3 < M; m += 4) {
+            sum += dY[m * N + n] * X[m * K + k];
+            sum += dY[(m + 1) * N + n] * X[(m + 1) * K + k];
+            sum += dY[(m + 2) * N + n] * X[(m + 2) * K + k];
+            sum += dY[(m + 3) * N + n] * X[(m + 3) * K + k];
+        }
+        for (; m < M; ++m) {
             sum += dY[m * N + n] * X[m * K + k];
         }
+
         dOverride[idx] = sum;
     }
 }
@@ -371,8 +382,8 @@ torch::Tensor forward_impl(torch::Tensor X, torch::Tensor override_values, int i
     
     auto Y = torch::empty({M, N}, X.options());
     
-    dim3 threads(32, 32);
-    dim3 blocks((N + 31) / 32, (M + 127) / 128);
+    dim3 threads(16, 16);
+    dim3 blocks((N + 63) / 64, (M + 63) / 64);
     
     const float* bias_ptr = nullptr;
     if (has_bias && bias.has_value()) {
@@ -397,8 +408,8 @@ std::vector<torch::Tensor> backward_impl(torch::Tensor dY, torch::Tensor X, torc
     auto dX = torch::empty({M, K}, X.options());
     auto dOverride = torch::zeros({num_sparse}, override_values.options());
     
-    dim3 threads(32, 32);
-    dim3 blocks_dx((K + 31) / 32, (M + 127) / 128);
+    dim3 threads(16, 16);
+    dim3 blocks_dx((K + 63) / 64, (M + 63) / 64);
     
     backward_dx_kernel_optimized<<<blocks_dx, threads>>>(
         dY.data_ptr<float>(), dX.data_ptr<float>(),
@@ -433,7 +444,7 @@ std::vector<torch::Tensor> backward_impl(torch::Tensor dY, torch::Tensor X, torc
 
 try:
     procedural_linear_ext = load_inline(
-        name='procedural_linear_ext',
+        name='procedural_linear_ext_blocks3',
         cpp_sources=cpp_source,
         cuda_sources=cuda_source,
         functions=['forward_impl', 'backward_impl'],
@@ -558,7 +569,6 @@ class MultiheadAttentionBatch(nn.Module):
         self.key = ProceduralLinear(n_embed, n_embed, seed=seed_base+2, sparsity=sparsity, bias=False, block_index=bi+1)
         self.value = ProceduralLinear(n_embed, n_embed, seed=seed_base+3, sparsity=sparsity, bias=False, block_index=bi+2)
         self.proj = ProceduralLinear(n_embed, n_embed, seed=seed_base+4, sparsity=sparsity, bias=False, block_index=bi+3)
-        # self.proj = nn.Linear(n_embed, n_embed)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
@@ -572,8 +582,8 @@ class MultiheadAttentionBatch(nn.Module):
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
-        
-        out = wei @ v 
+
+        out = wei @ v
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.proj(out)
         out = self.dropout(out)
